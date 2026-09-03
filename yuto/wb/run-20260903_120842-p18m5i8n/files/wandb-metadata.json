@@ -1,0 +1,61 @@
+{
+  "os": "Linux-5.15.0-139-generic-x86_64-with-glibc2.31",
+  "python": "CPython 3.12.14",
+  "startedAt": "2026-09-03T04:08:42.961241Z",
+  "args": [
+    "Mjlab-Velocity-Flat-MicroDuck",
+    "--env.scene.num-envs",
+    "4096",
+    "--agent.resume",
+    "True",
+    "--agent.load-run",
+    "2026-09-03_09-57-53_velocity_flat_01",
+    "--agent.load-checkpoint",
+    "model_4999.pt",
+    "--agent.max-iterations",
+    "5000",
+    "--agent.save-interval",
+    "250",
+    "--agent.run-name",
+    "velocity_flat_resume_01",
+    "--agent.logger",
+    "wandb",
+    "--enable-nan-guard",
+    "True"
+  ],
+  "program": "/home/zhangyutao/Mount/yuto/codes/microduck_rl/.venv/bin/train",
+  "codePath": ".venv/bin/train",
+  "codePathLocal": ".venv/bin/train",
+  "git": {
+    "remote": "git@github.com:JoyJeeo/microduck_rl.git",
+    "commit": "5946fd9cdbc58956424420153e51975af3b30d77"
+  },
+  "email": "z1286953465@gmail.com",
+  "root": "/home/zhangyutao/Mount/yuto/codes/microduck_rl",
+  "host": "hsy-System-Product-Name",
+  "executable": "/home/zhangyutao/Mount/yuto/codes/microduck_rl/.venv/bin/python3",
+  "cpu_count": 24,
+  "cpu_count_logical": 32,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "gpu_count": 1,
+  "disk": {
+    "/": {
+      "total": "941979693056",
+      "used": "636232294400"
+    }
+  },
+  "memory": {
+    "total": "67196256256"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-32d8873d-f716-4fd1-0305-800fb6c0a270"
+    }
+  ],
+  "cudaVersion": "13.0",
+  "writerId": "hqfv9qxuo07klvn29pigga47kd1wjp8a"
+}
