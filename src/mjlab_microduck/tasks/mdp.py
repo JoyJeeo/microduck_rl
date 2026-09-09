@@ -4505,6 +4505,63 @@ def face_down_prob_curriculum(
 class VelocityCommandCommandOnly(UniformVelocityCommand):
     """Like UniformVelocityCommand but only draws the command arrows (no actual velocity arrows)."""
 
+    def create_gui(
+        self,
+        name,
+        server,
+        get_env_idx,
+        on_change=None,
+        request_action=None,
+    ) -> None:
+        """Create velocity sliders, including intentionally zero-range axes."""
+        from viser import Icon
+
+        del on_change, request_action
+        ranges = self.cfg.ranges
+        axes = [
+            ("lin_vel_x", max(abs(v) for v in ranges.lin_vel_x)),
+            ("lin_vel_y", max(abs(v) for v in ranges.lin_vel_y)),
+            ("ang_vel_z", max(abs(v) for v in ranges.ang_vel_z)),
+        ]
+        sliders = []
+
+        with server.gui.add_folder(name.capitalize()):
+            enabled = server.gui.add_checkbox("Enable", initial_value=False)
+
+            for label, max_val in axes:
+                max_input = server.gui.add_slider(
+                    f"Max {label}",
+                    initial_value=max_val,
+                    step=0.1,
+                    min=0.0,
+                    max=10.0,
+                )
+                slider = server.gui.add_slider(
+                    label,
+                    min=-max_val,
+                    max=max_val,
+                    step=0.05,
+                    initial_value=0.0,
+                )
+
+                @max_input.on_update
+                def _(_ev, _s=slider, _m=max_input) -> None:
+                    _s.min = -_m.value
+                    _s.max = _m.value
+
+                sliders.append(slider)
+
+            zero_btn = server.gui.add_button("Zero", icon=Icon.SQUARE_X)
+
+            @zero_btn.on_click
+            def _(_) -> None:
+                for slider in sliders:
+                    slider.value = 0.0
+
+        self._joystick_enabled = enabled
+        self._joystick_sliders = sliders
+        self._joystick_get_env_idx = get_env_idx
+
     def _resample_command(self, env_ids: torch.Tensor) -> None:
         super()._resample_command(env_ids)
         # Turn-in-place practice: for a fraction of envs, zero the linear velocity

@@ -25,6 +25,32 @@ uv run --with pytest pytest tests/
 A 5-iteration smoke test at 64 envs catches ~95% of config errors for cents.
 Never launch a long run without one.
 
+## AI development issues
+
+Local development issues are Git-tracked under [`.ai/`](.ai/). Before recording,
+preflighting, or developing an issue, read [`.ai/README.md`](.ai/README.md) and
+follow its lifecycle and file formats.
+
+- At most one issue may be under development at a time. Recording other issues
+  does not authorize their implementation.
+- Classify every new issue as `single` or `phased` when it is recorded. A phased
+  issue must have a bidirectionally linked spec in `.ai/specs/`.
+- Before any development, perform a read-only preflight for the exact issue and,
+  when applicable, the exact phase. Confirm required user resources, unresolved
+  decisions, assumptions, affected areas, verification, and material risks.
+- A request to start development does not bypass a missing preflight. Wait for an
+  explicit authorization naming the preflighted issue and phase before changing
+  product code or running state-changing development operations.
+- One authorization covers one `single` issue or one phase of a `phased` issue.
+  Never continue automatically to the next phase; preflight it and wait for a new
+  authorization.
+- Stop and reconfirm when scope materially changes, a spec assumption is
+  invalidated, user input is required, or existing worktree changes conflict.
+- Record actual verification results in the issue/spec. Mark work `done` only when
+  its acceptance criteria are met, and never claim checks that were not run.
+- Git-tracked planning files do not imply permission to create a commit. Commit
+  only when the user requests it.
+
 ## Repo map
 
 - `src/mjlab_microduck/tasks/mdp.py` — ALL custom MDP functions (rewards, events,
