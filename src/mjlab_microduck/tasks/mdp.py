@@ -4688,6 +4688,357 @@ class RelativeHeadingVelocityCommandCfg(UniformVelocityCommandCfg):
         return RelativeHeadingVelocityCommand(self, env)
 
 
+# --------------------------------------------------------------------------- #
+# Roller acceleration / coast / brake command                                     #
+# --------------------------------------------------------------------------- #
+
+ROLLER_IDLE, ROLLER_ACCEL, ROLLER_COAST, ROLLER_BRAKE, ROLLER_FULL_CYCLE = range(5)
+ROLLER_PHASE_IDLE, ROLLER_PHASE_ACCEL, ROLLER_PHASE_COAST, ROLLER_PHASE_BRAKE, ROLLER_PHASE_STOP, ROLLER_PHASE_DONE = range(6)
+
+
+def roller_scenario_ids(draw: torch.Tensor, probabilities: tuple[float, ...]) -> torch.Tensor:
+    """Map uniform draws to explicit roller scenario IDs.
+
+    The helper is deliberately pure so the fixed Stage-A sampling contract can
+    be tested without constructing a MuJoCo environment.
+    """
+    if len(probabilities) != 5 or not math.isclose(sum(probabilities), 1.0, abs_tol=1e-6):
+        raise ValueError("roller scenario probabilities must contain five values summing to one")
+    limits = torch.tensor(probabilities, device=draw.device, dtype=draw.dtype).cumsum(0)
+    return torch.bucketize(draw, limits, right=True).clamp(max=4)
+
+
+def roller_signed_progress(current: torch.Tensor, previous: torch.Tensor) -> torch.Tensor:
+    """One-step signed speed progress; alternating speed changes cannot farm it."""
+    return current - previous
+
+
+class RollerAccelBrakeCommand(UniformVelocityCommand):
+    """Hidden training state for the roller command cycle.
+
+    Only ``vel_command_b`` is observed by the actor. Scenario and phase state
+    remain here so resets, rewards, and terminations share one source of truth.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self._env_ref = env
+        self._probabilities = tuple(cfg.scenario_probabilities)
+        self._positive_commands = torch.tensor(cfg.positive_commands, device=self.device)
+        self._brake_command = float(cfg.brake_command)
+        self._entry_speeds = torch.tensor(cfg.rolling_entry_speeds, device=self.device)
+        self._idle_s = float(cfg.idle_s)
+        self._accel_delay_s = float(cfg.accel_delay_s)
+        self._accel_s = float(cfg.accel_s)
+        self._coast_s = float(cfg.coast_s)
+        self._brake_s = float(cfg.brake_s)
+        self._stop_dwell_s = float(cfg.stop_dwell_s)
+        self._stop_speed = float(cfg.stop_speed)
+        self._reverse_speed = float(cfg.reverse_speed)
+        self._stop_z = float(cfg.stop_z)
+        self._stop_cos_tilt = math.cos(math.radians(float(cfg.stop_tilt_deg)))
+
+        self.scenario = torch.full((self.num_envs,), ROLLER_IDLE, dtype=torch.long, device=self.device)
+        self.phase = torch.full_like(self.scenario, ROLLER_PHASE_IDLE)
+        self.elapsed = torch.zeros(self.num_envs, device=self.device)
+        self.entry_speed = torch.zeros(self.num_envs, device=self.device)
+        self.positive_command = torch.zeros(self.num_envs, device=self.device)
+        self.previous_speed = torch.zeros(self.num_envs, device=self.device)
+        self.speed_delta = torch.zeros(self.num_envs, device=self.device)
+        self.prior_motion = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.stop_dwell = torch.zeros(self.num_envs, device=self.device)
+        self.stop_success = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.stop_bonus_pending = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.max_reverse_speed = torch.zeros(self.num_envs, device=self.device)
+        self.brake_start_x = torch.zeros(self.num_envs, device=self.device)
+        self._prepared = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._last_refresh_step = -1
+
+    def prepare_reset(self, env_ids: torch.Tensor, scenario_ids: torch.Tensor | None = None) -> None:
+        """Choose a scenario before the reset event writes its rolling state."""
+        if len(env_ids) == 0:
+            return
+        n = len(env_ids)
+        if scenario_ids is None:
+            scenario_ids = roller_scenario_ids(torch.rand(n, device=self.device), self._probabilities)
+        self.scenario[env_ids] = scenario_ids
+        self.phase[env_ids] = ROLLER_PHASE_IDLE
+        self.elapsed[env_ids] = 0.0
+        self.entry_speed[env_ids] = 0.0
+        rolling = (scenario_ids == ROLLER_COAST) | (scenario_ids == ROLLER_BRAKE)
+        if rolling.any():
+            self.entry_speed[env_ids[rolling]] = self._entry_speeds[
+                torch.randint(len(self._entry_speeds), (int(rolling.sum()),), device=self.device)
+            ]
+        self.positive_command[env_ids] = self._positive_commands[
+            torch.randint(len(self._positive_commands), (n,), device=self.device)
+        ]
+        self.vel_command_b[env_ids] = 0.0
+        self._prepared[env_ids] = True
+
+    def reset(self, env_ids: torch.Tensor | None) -> dict:
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        if len(env_ids) == 0:
+            return {}
+        extras = {}
+        for metric_name, metric_value in self.metrics.items():
+            extras[metric_name] = torch.mean(metric_value[env_ids]).item()
+            metric_value[env_ids] = 0.0
+        self.command_counter[env_ids] = 0
+        missing = env_ids[~self._prepared[env_ids]]
+        if len(missing):
+            self.prepare_reset(missing)
+        scenario = self.scenario[env_ids]
+        self.phase[env_ids] = torch.where(
+            scenario == ROLLER_COAST,
+            torch.full_like(scenario, ROLLER_PHASE_COAST),
+            torch.where(
+                scenario == ROLLER_BRAKE,
+                torch.full_like(scenario, ROLLER_PHASE_BRAKE),
+                torch.full_like(scenario, ROLLER_PHASE_IDLE),
+            ),
+        )
+        self.elapsed[env_ids] = 0.0
+        self.previous_speed[env_ids] = self.entry_speed[env_ids]
+        self.speed_delta[env_ids] = 0.0
+        self.prior_motion[env_ids] = self.entry_speed[env_ids].abs() > self._stop_speed
+        self.stop_dwell[env_ids] = 0.0
+        self.stop_success[env_ids] = False
+        self.stop_bonus_pending[env_ids] = False
+        self.max_reverse_speed[env_ids] = 0.0
+        self.brake_start_x[env_ids] = 0.0
+        self._prepared[env_ids] = False
+        self._last_refresh_step = -1
+        self._update_command()
+        return extras
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        pass  # Resets are selected by prepare_reset(), never by a timer.
+
+    def _set_phase_and_command(self) -> None:
+        s, t = self.scenario, self.elapsed
+        phase = torch.full_like(s, ROLLER_PHASE_DONE)
+        command = torch.zeros_like(t)
+
+        idle = s == ROLLER_IDLE
+        phase[idle & (t < self._idle_s)] = ROLLER_PHASE_IDLE
+
+        accel = s == ROLLER_ACCEL
+        phase[accel & (t < self._accel_delay_s)] = ROLLER_PHASE_IDLE
+        accelerating = accel & (t >= self._accel_delay_s) & (t < self._accel_delay_s + self._accel_s)
+        phase[accelerating] = ROLLER_PHASE_ACCEL
+        command[accelerating] = self.positive_command[accelerating]
+
+        coast = s == ROLLER_COAST
+        phase[coast & (t < self._coast_s)] = ROLLER_PHASE_COAST
+
+        brake = s == ROLLER_BRAKE
+        braking = brake & (t < self._brake_s)
+        phase[braking] = ROLLER_PHASE_BRAKE
+        command[braking] = self._brake_command
+        phase[brake & ~braking & (t < self._brake_s + self._stop_dwell_s)] = ROLLER_PHASE_STOP
+
+        full = s == ROLLER_FULL_CYCLE
+        phase[full & (t < self._accel_delay_s)] = ROLLER_PHASE_IDLE
+        full_accel = full & (t >= self._accel_delay_s) & (t < self._accel_delay_s + self._accel_s)
+        phase[full_accel] = ROLLER_PHASE_ACCEL
+        command[full_accel] = self.positive_command[full_accel]
+        coast_start = self._accel_delay_s + self._accel_s
+        full_coast = full & (t >= coast_start) & (t < coast_start + self._coast_s)
+        phase[full_coast] = ROLLER_PHASE_COAST
+        brake_start = coast_start + self._coast_s
+        full_brake = full & (t >= brake_start) & (t < brake_start + self._brake_s)
+        phase[full_brake] = ROLLER_PHASE_BRAKE
+        command[full_brake] = self._brake_command
+        full_stop = full & (t >= brake_start + self._brake_s) & (t < brake_start + self._brake_s + self._stop_dwell_s)
+        phase[full_stop] = ROLLER_PHASE_STOP
+
+        entering_brake = (self.phase != ROLLER_PHASE_BRAKE) & (phase == ROLLER_PHASE_BRAKE)
+        if entering_brake.any():
+            self.brake_start_x[entering_brake] = self.robot.data.root_link_pos_w[entering_brake, 0]
+        self.phase = phase
+        self.vel_command_b[:, 0] = command
+        self.vel_command_b[:, 1:] = 0.0
+
+    def refresh_state(self) -> None:
+        """Advance hidden state at most once per physics step for all consumers."""
+        step = int(self._env_ref.common_step_counter)
+        if step == self._last_refresh_step:
+            return
+        self._last_refresh_step = step
+        self.elapsed += self._env_ref.step_dt
+        self._set_phase_and_command()
+        speed = torch.nan_to_num(self.robot.data.root_link_lin_vel_b[:, 0], nan=0.0)
+        self.speed_delta = roller_signed_progress(speed, self.previous_speed)
+        self.previous_speed = speed
+        self.prior_motion |= speed.abs() > self._stop_speed
+        braking_or_stop = (self.phase == ROLLER_PHASE_BRAKE) | (self.phase == ROLLER_PHASE_STOP)
+        self.max_reverse_speed = torch.where(
+            braking_or_stop,
+            torch.maximum(self.max_reverse_speed, (-speed).clamp(min=0.0)),
+            self.max_reverse_speed,
+        )
+        quat = self.robot.data.root_link_quat_w
+        cos_tilt = 1.0 - 2.0 * (quat[:, 1].square() + quat[:, 2].square())
+        height = self.robot.data.root_link_pos_w[:, 2] - self._env_ref.scene.terrain.env_origins[:, 2]
+        stable = (
+            self.prior_motion
+            & braking_or_stop
+            & (speed.abs() <= self._stop_speed)
+            & (self.max_reverse_speed <= self._reverse_speed)
+            & (cos_tilt >= self._stop_cos_tilt)
+            & (height >= self._stop_z)
+        )
+        self.stop_dwell = torch.where(stable, self.stop_dwell + self._env_ref.step_dt, torch.zeros_like(self.stop_dwell))
+        new_success = stable & (self.stop_dwell >= self._stop_dwell_s) & ~self.stop_success
+        self.stop_success |= new_success
+        self.stop_bonus_pending |= new_success
+
+    def _update_command(self) -> None:
+        self._set_phase_and_command()
+
+    def _update_metrics(self) -> None:
+        self.refresh_state()
+        for name, scenario in (
+            ("idle", ROLLER_IDLE),
+            ("accel", ROLLER_ACCEL),
+            ("coast", ROLLER_COAST),
+            ("brake", ROLLER_BRAKE),
+            ("full_cycle", ROLLER_FULL_CYCLE),
+        ):
+            key = f"scenario_fraction/{name}"
+            self.metrics[key] = self.metrics.get(key, torch.zeros_like(self.elapsed)) + (self.scenario == scenario).float()
+        self.metrics["roller/body_speed"] = self.metrics.get("roller/body_speed", torch.zeros_like(self.elapsed)) + self.previous_speed.abs()
+        self.metrics["roller/stop_success"] = self.metrics.get("roller/stop_success", torch.zeros_like(self.elapsed)) + self.stop_success.float()
+
+
+@_dataclass(kw_only=True)
+class RollerAccelBrakeCommandCfg(UniformVelocityCommandCfg):
+    scenario_probabilities: tuple[float, ...] = (0.20, 0.78, 0.0, 0.02, 0.0)
+    positive_commands: tuple[float, ...] = (0.10, 0.20, 0.25, 0.30, 0.40, 0.60)
+    brake_command: float = -0.50
+    rolling_entry_speeds: tuple[float, ...] = (0.10, 0.20, 0.30)
+    idle_s: float = 6.0
+    accel_delay_s: float = 1.0
+    accel_s: float = 5.0
+    coast_s: float = 0.5
+    brake_s: float = 4.0
+    stop_dwell_s: float = 0.5
+    stop_speed: float = 0.05
+    reverse_speed: float = 0.03
+    stop_z: float = 0.09
+    stop_tilt_deg: float = 30.0
+
+    def build(self, env: ManagerBasedRlEnv) -> "RollerAccelBrakeCommand":
+        return RollerAccelBrakeCommand(self, env)
+
+
+def reset_roller_accel_brake(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor,
+    command_name: str = "twist",
+    wheel_radius: float = 0.0175,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Prepare a scenario and write matched body/wheel rolling entry state."""
+    if len(env_ids) == 0:
+        return
+    command = env.command_manager.get_term(command_name)
+    if not isinstance(command, RollerAccelBrakeCommand):
+        raise TypeError(f"{command_name} must use RollerAccelBrakeCommand")
+    command.prepare_reset(env_ids)
+    rolling_ids = env_ids[command.entry_speed[env_ids] > 0.0]
+    if len(rolling_ids) == 0:
+        return
+    asset: Entity = env.scene[asset_cfg.name]
+    speed = command.entry_speed[rolling_ids]
+    root_vel = torch.zeros(len(rolling_ids), 6, device=env.device)
+    root_vel[:, 0] = speed  # P2 fixes spawn yaw to zero, so world +X is forward.
+    asset.write_root_link_velocity_to_sim(root_vel, env_ids=rolling_ids)
+    wheel_ids, _ = asset.find_joints(r"^passive_.*wheel")
+    omega = (speed / wheel_radius).unsqueeze(1).expand(-1, len(wheel_ids))
+    asset.write_joint_velocity_to_sim(omega, joint_ids=wheel_ids, env_ids=rolling_ids)
+
+
+def _roller_command(env: ManagerBasedRlEnv, command_name: str) -> RollerAccelBrakeCommand:
+    command = env.command_manager.get_term(command_name)
+    if not isinstance(command, RollerAccelBrakeCommand):
+        raise TypeError(f"{command_name} must use RollerAccelBrakeCommand")
+    command.refresh_state()
+    return command
+
+
+def roller_forward_motion(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.Tensor:
+    """Positive body travel only during the acceleration portion of a cycle."""
+    command = _roller_command(env, command_name)
+    return command.previous_speed.clamp(min=0.0, max=0.5) * (command.phase == ROLLER_PHASE_ACCEL)
+
+
+def roller_acceleration_progress(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.Tensor:
+    command = _roller_command(env, command_name)
+    return command.speed_delta * (command.phase == ROLLER_PHASE_ACCEL)
+
+
+def roller_braking_progress(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.Tensor:
+    command = _roller_command(env, command_name)
+    return -roller_signed_progress(command.previous_speed.abs(), (command.previous_speed - command.speed_delta).abs()) * (
+        command.phase == ROLLER_PHASE_BRAKE
+    )
+
+
+def roller_coast_retention(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.Tensor:
+    command = _roller_command(env, command_name)
+    moving = command.prior_motion & (command.phase == ROLLER_PHASE_COAST)
+    return torch.where(moving, command.previous_speed.clamp(min=0.0), torch.zeros_like(command.previous_speed))
+
+
+def roller_wheel_body_slip_cost(
+    env: ManagerBasedRlEnv,
+    wheel_radius: float = 0.0175,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    asset: Entity = env.scene[asset_cfg.name]
+    wheel_ids, _ = asset.find_joints(r"^passive_.*wheel")
+    wheel_speed = asset.data.joint_vel[:, wheel_ids].mean(dim=1) * wheel_radius
+    body_speed = asset.data.root_link_lin_vel_b[:, 0]
+    return torch.nan_to_num((wheel_speed - body_speed).abs(), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def roller_reverse_overshoot_cost(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.Tensor:
+    command = _roller_command(env, command_name)
+    return torch.where(
+        (command.phase == ROLLER_PHASE_BRAKE) | (command.phase == ROLLER_PHASE_STOP),
+        command.previous_speed.neg().clamp(min=0.0),
+        torch.zeros_like(command.previous_speed),
+    )
+
+
+def roller_stop_success_bonus(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.Tensor:
+    command = _roller_command(env, command_name)
+    bonus = command.stop_bonus_pending.float()
+    command.stop_bonus_pending.zero_()
+    return bonus
+
+
+def roller_stop_success(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.Tensor:
+    return _roller_command(env, command_name).stop_success
+
+
+def roller_scenario_complete(env: ManagerBasedRlEnv, command_name: str = "twist") -> torch.Tensor:
+    command = _roller_command(env, command_name)
+    duration = torch.full_like(command.elapsed, command._idle_s)
+    duration = torch.where(command.scenario == ROLLER_ACCEL, command._accel_delay_s + command._accel_s, duration)
+    duration = torch.where(command.scenario == ROLLER_COAST, command._coast_s, duration)
+    duration = torch.where(command.scenario == ROLLER_BRAKE, command._brake_s + command._stop_dwell_s, duration)
+    duration = torch.where(
+        command.scenario == ROLLER_FULL_CYCLE,
+        command._accel_delay_s + command._accel_s + command._coast_s + command._brake_s + command._stop_dwell_s,
+        duration,
+    )
+    return command.elapsed >= duration
+
+
 def heading_tracking_reward(
     env: ManagerBasedRlEnv,
     command_name: str,
